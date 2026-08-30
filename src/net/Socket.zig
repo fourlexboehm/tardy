@@ -7,7 +7,11 @@ kind: Kind,
 pub fn init(options: Options) !Socket {
     const addr: Address.Config = switch (options) {
         .tcp, .udp => |config| .{
-            .ip = try .parse(config.host, config.port),
+            .ip = blk: {
+                // we only support non-root ports
+                debug.assert(config.port > 1023);
+                break :blk try .parse(config.host, config.port);
+            },
         },
         // Not supported on Windows at the moment.
         .unix => |path| if (builtin.os.tag == .windows)

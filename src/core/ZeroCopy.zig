@@ -39,7 +39,7 @@ pub fn ZeroCopy(comptime T: type) type {
         pub fn get_write_area(zc: *ZeroCopy_t, gpa: mem.Allocator, size: usize) ![]T {
             const available_space = zc.capacity - zc.len;
             if (available_space >= size) {
-                return zc.ptr[zc.len .. zc.len + size];
+                return zc.ptr[zc.len..][0..size];
             } else {
                 const old_slice = zc.ptr[0..zc.capacity];
                 const new_size = try std.math.ceilPowerOfTwo(
