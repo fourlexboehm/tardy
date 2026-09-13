@@ -154,6 +154,16 @@ pub fn close_blocking(sock: *const Socket) void {
     syscall.close(sock.handle);
 }
 
+pub fn shutdown(sock: *const Socket, rt: *Runtime) !void {
+    const stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = sock.handle,
+            .address = undefined,
+        },
+    };
+    try stream.shutdown(rt.io, .both);
+}
+
 pub fn accept(sock: *const Socket, rt: *Runtime) !Socket {
     debug.assert(sock.kind.listenable());
     if (rt.aio.features.has_capability(.accept)) {

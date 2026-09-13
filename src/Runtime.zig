@@ -9,6 +9,7 @@ scheduler: Scheduler,
 io: std.Io,
 aio: AsyncIO,
 id: usize,
+count: usize,
 running: bool,
 
 // The currently running Task's index.
@@ -33,6 +34,7 @@ pub fn init(
         .aio = aio,
         .io = io,
         .id = options.id,
+        .count = options.count,
         .current_task = null,
         .running = false,
     };
@@ -204,6 +206,7 @@ const log = std.log.scoped(.@"tardy/Runtime");
 
 const Options = struct {
     id: usize,
+    count: usize = 1,
     pooling: pool.Kind,
     size_tasks_initial: usize,
     size_aio_reap_max: usize,

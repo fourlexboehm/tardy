@@ -43,7 +43,12 @@ pub fn Tardy(comptime selected_aio: AsyncIO.Kind) type {
         }
 
         /// This will spawn a new Runtime.
-        fn spawn_runtime(tardy: *Tardy_t, id: usize, options: AsyncIO.Options) !Runtime {
+        fn spawn_runtime(
+            tardy: *Tardy_t,
+            id: usize,
+            runtime_count: usize,
+            options: AsyncIO.Options,
+        ) !Runtime {
             tardy.mutex.lockUncancelable(tardy.io);
             defer tardy.mutex.unlock(tardy.io);
 
@@ -72,6 +77,7 @@ pub fn Tardy(comptime selected_aio: AsyncIO.Kind) type {
 
             return try .init(tardy.gpa, tardy.io, aio, .{
                 .id = id,
+                .count = runtime_count,
                 .pooling = tardy.options.pooling,
                 .size_tasks_initial = tardy.options.size_tasks_initial,
                 .size_aio_reap_max = tardy.options.size_aio_reap_max,
@@ -103,7 +109,7 @@ pub fn Tardy(comptime selected_aio: AsyncIO.Kind) type {
             var spawned_count: atomic.Value(usize) = .init(0);
             const spawning_count = runtime_count - 1;
 
-            var runtime = try tardy.spawn_runtime(0, .{
+            var runtime = try tardy.spawn_runtime(0, runtime_count, .{
                 .parent_async = null,
                 .pooling = tardy.options.pooling,
                 .size_tasks_initial = tardy.options.size_tasks_initial,
@@ -145,6 +151,7 @@ pub fn Tardy(comptime selected_aio: AsyncIO.Kind) type {
                     ) void {
                         var rt = td.spawn_runtime(
                             current_id,
+                            total_count + 1,
                             .{
                                 .parent_async = parent,
                                 .pooling = td.options.pooling,
