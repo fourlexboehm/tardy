@@ -6,6 +6,7 @@ change_count: usize = 0,
 events: []posix.Kevent,
 
 jobs: pool.Pool(Job),
+pending_completions: std.ArrayList(results.Completion),
 
 pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Kqueue {
     const kqueue_fd = try syscall.kqueue();
@@ -56,6 +57,7 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Kqueue {
         .changes = changes,
         .change_count = 0,
         .jobs = jobs,
+        .pending_completions = .empty,
     };
 }
 
@@ -64,6 +66,7 @@ pub fn inner_deinit(kqueue: *Kqueue, gpa: mem.Allocator) void {
     gpa.free(kqueue.events);
     gpa.free(kqueue.changes);
     kqueue.jobs.deinit(gpa);
+    kqueue.pending_completions.deinit(gpa);
 }
 
 pub fn deinit(runner: *anyopaque, gpa: mem.Allocator) void {
@@ -89,6 +92,11 @@ pub fn queue_job(
             gpa,
             task,
             accept.socket,
+        ),
+        .cancel_accept => |socket| kqueue.queue_cancel_accept(
+            gpa,
+            task,
+            socket,
         ),
         .connect => |connect| kqueue.queue_connect(
             gpa,
@@ -154,6 +162,16 @@ fn queue_accept(
     task: usize,
     socket: *const net.Socket,
 ) Error!void {
+    var already_registered = false;
+    var iter = kqueue.jobs.iterator();
+    while (iter.next()) |job| switch (job.type) {
+        .accept => |accept| if (accept.listener == socket.handle) {
+            already_registered = true;
+            break;
+        },
+        else => {},
+    };
+
     const index = try kqueue.jobs.borrow_hint(gpa, task);
     errdefer kqueue.jobs.release(index);
 
@@ -162,6 +180,7 @@ fn queue_accept(
         .index = index,
         .type = .{
             .accept = .{
+                .listener = socket.handle,
                 .socket = .{
                     .handle = socket.handle,
                     .addr = .init(socket.addr.family()),
@@ -172,19 +191,105 @@ fn queue_accept(
         .task = task,
     };
 
-    if (kqueue.change_count < kqueue.changes.len) {
+    if (!already_registered)
+        try kqueue.queue_accept_event(index, socket.handle);
+}
+
+fn queue_cancel_accept(
+    kqueue: *Kqueue,
+    gpa: mem.Allocator,
+    task: usize,
+    socket: net.Socket.Handle,
+) Error!void {
+    var count: usize = 0;
+    var count_iter = kqueue.jobs.iterator();
+    while (count_iter.next()) |job| switch (job.type) {
+        .accept => |accept| if (accept.listener == socket) {
+            count += 1;
+        },
+        else => {},
+    };
+
+    try kqueue.pending_completions.ensureUnusedCapacity(gpa, count + 1);
+    if (count != 0) {
+        if (kqueue.change_count >= kqueue.changes.len)
+            return error.ChangeQueueFull;
+
         const event = &kqueue.changes[kqueue.change_count];
         kqueue.change_count += 1;
-
         event.* = .{
-            .ident = @intCast(socket.handle),
+            .ident = @intCast(socket),
             .filter = posix.system.EVFILT.READ,
-            .flags = posix.system.EV.ADD | posix.system.EV.ONESHOT,
+            .flags = posix.system.EV.DELETE,
             .fflags = 0,
             .data = 0,
-            .udata = index,
+            .udata = 0,
         };
-    } else return error.ChangeQueueFull;
+    }
+
+    var iter = kqueue.jobs.iterator();
+    while (iter.next_index()) |index| {
+        const job = kqueue.jobs.get(index);
+        switch (job.type) {
+            .accept => |accept| {
+                if (accept.listener != socket) continue;
+                kqueue.jobs.release(index);
+                kqueue.pending_completions.appendAssumeCapacity(.{
+                    .task = job.task,
+                    .result = .{ .accept = .{ .err = error.Canceled } },
+                });
+            },
+            else => {},
+        }
+    }
+
+    kqueue.pending_completions.appendAssumeCapacity(.{
+        .task = task,
+        .result = .{
+            .cancel_accept = .{
+                .actual = .{ .canceled = count },
+            },
+        },
+    });
+}
+
+fn queue_accept_event(
+    kqueue: *Kqueue,
+    index: usize,
+    socket: net.Socket.Handle,
+) Error!void {
+    if (kqueue.change_count >= kqueue.changes.len)
+        return error.ChangeQueueFull;
+
+    const event = &kqueue.changes[kqueue.change_count];
+    kqueue.change_count += 1;
+    event.* = .{
+        .ident = @intCast(socket),
+        .filter = posix.system.EVFILT.READ,
+        .flags = posix.system.EV.ADD | posix.system.EV.ONESHOT,
+        .fflags = 0,
+        .data = 0,
+        .udata = index,
+    };
+}
+
+fn advance_accept(
+    kqueue: *Kqueue,
+    current: usize,
+    socket: net.Socket.Handle,
+) !void {
+    var iter = kqueue.jobs.iterator();
+    while (iter.next_index()) |index| {
+        if (index == current) continue;
+        const job = kqueue.jobs.get(index);
+        switch (job.type) {
+            .accept => |accept| {
+                if (accept.listener != socket) continue;
+                return try kqueue.queue_accept_event(index, socket);
+            },
+            else => {},
+        }
+    }
 }
 
 fn queue_connect(
@@ -343,6 +448,12 @@ pub fn reap(
     wait: bool,
 ) ![]results.Completion {
     const kqueue: *Kqueue = @ptrCast(@alignCast(runner));
+    const pending = results.drainPending(
+        &kqueue.pending_completions,
+        completions,
+    );
+    if (pending.len != 0) return pending;
+
     var reaped: usize = 0;
 
     while (reaped == 0 and wait) {
@@ -386,26 +497,31 @@ pub fn reap(
                     .accept => |*accept| {
                         debug.assert(event.filter == posix.system.EVFILT.READ);
 
-                        const client_fd = syscall.accept(
-                            accept.socket.handle,
-                            &accept.socket.addr,
-                            0,
-                        ) catch |err| break :result .{
-                            .accept = .{
+                        const accept_result: results.AcceptResult = accepted: {
+                            const client_fd = syscall.accept(
+                                accept.socket.handle,
+                                &accept.socket.addr,
+                                0,
+                            ) catch |err| break :accepted .{
                                 .err = err,
-                            },
-                        };
+                            };
 
-                        break :result .{
-                            .accept = .{
+                            break :accepted .{
                                 .actual = .{
                                     .handle = client_fd,
                                     .addr = accept.socket.addr,
                                     .kind = accept.socket.kind,
                                 },
-                            },
+                            };
                         };
+
+                        try kqueue.advance_accept(
+                            job_index,
+                            accept.listener,
+                        );
+                        break :result .{ .accept = accept_result };
                     },
+                    .cancel_accept => unreachable,
                     .connect => {
                         debug.assert(event.filter == posix.system.EVFILT.WRITE);
 
@@ -516,6 +632,7 @@ pub fn to_async(kqueue: *Kqueue) AsyncIO {
         .features = .init(&.{
             .timer,
             .accept,
+            .cancel_accept,
             .connect,
             .recv,
             .send,

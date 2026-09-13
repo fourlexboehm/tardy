@@ -210,6 +210,27 @@ pub fn accept(sock: *const Socket, rt: *Runtime) !Socket {
     }
 }
 
+/// Cancel every accept operation for this socket queued on `rt`.
+/// This must run from a task owned by `rt`. It does not close the socket.
+pub fn cancelAccepts(sock: *const Socket, rt: *Runtime) !usize {
+    if (!rt.aio.features.has_capability(.cancel_accept))
+        return error.OperationNotSupported;
+
+    var canceled: usize = 0;
+    while (true) {
+        try rt.scheduler.ioAwait(rt.gpa, .{
+            .cancel_accept = sock.handle,
+        });
+
+        const index = rt.current_task.?;
+        const task = rt.scheduler.tasks.get(index);
+        const outcome = try task.result.cancel_accept.unwrap();
+        if (outcome.retry) continue;
+        if (outcome.canceled == 0) return canceled;
+        canceled += outcome.canceled;
+    }
+}
+
 pub fn connect(sock: *const Socket, rt: *Runtime) !void {
     if (rt.aio.features.has_capability(.connect)) {
         try rt.scheduler.ioAwait(rt.gpa, .{

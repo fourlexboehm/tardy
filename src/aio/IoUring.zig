@@ -8,6 +8,7 @@ wake_event_buffer: []u8,
 // You basically define how large you want your batches to be.
 cqes: []linux.io_uring_cqe,
 jobs: pool.Pool(JobBundle),
+pending_completions: std.ArrayList(results.Completion),
 
 const base_flags = blk: {
     var flags = 0;
@@ -122,6 +123,7 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) (OoM || Errors.Init)!I
         .wake_event_buffer = wake_event_buffer,
         .jobs = jobs,
         .cqes = cqes,
+        .pending_completions = .empty,
     };
 }
 
@@ -129,6 +131,7 @@ pub fn inner_deinit(io_uring: *IoUring, gpa: mem.Allocator) void {
     syscall.close(io_uring.wake_event_fd);
     io_uring.uring.deinit();
     io_uring.jobs.deinit(gpa);
+    io_uring.pending_completions.deinit(gpa);
     gpa.free(io_uring.wake_event_buffer);
     gpa.free(io_uring.cqes);
     gpa.destroy(io_uring.uring);
@@ -198,6 +201,11 @@ fn queue_job(
             gpa,
             task,
             accept.socket,
+        ),
+        .cancel_accept => |socket| uring.queue_cancel_accept(
+            gpa,
+            task,
+            socket,
         ),
         .connect => |connect| uring.queue_connect(
             gpa,
@@ -553,6 +561,7 @@ fn queue_accept(
         .index = index,
         .type = .{
             .accept = .{
+                .listener = socket.handle,
                 .socket = .{
                     .handle = math.maxInt(net.Socket.Handle),
                     .addr = client,
@@ -562,6 +571,62 @@ fn queue_accept(
         },
         .task = task,
     };
+}
+
+fn queue_cancel_accept(
+    io_uring: *IoUring,
+    gpa: mem.Allocator,
+    task: usize,
+    socket: net.Socket.Handle,
+) Error!void {
+    var target: ?usize = null;
+    var iter = io_uring.jobs.iterator();
+    while (iter.next_index()) |index| {
+        const candidate = io_uring.jobs.get(index).job;
+        switch (candidate.type) {
+            .accept => |accept| if (accept.listener == socket) {
+                var already_targeted = false;
+                var cancel_iter = io_uring.jobs.iterator();
+                while (cancel_iter.next()) |queued| switch (queued.job.type) {
+                    .cancel_accept => |cancel| {
+                        if (cancel.target == index) {
+                            already_targeted = true;
+                            break;
+                        }
+                    },
+                    else => {},
+                };
+                if (already_targeted) continue;
+                target = index;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    const target_index = target orelse {
+        try io_uring.pending_completions.append(gpa, .{
+            .task = task,
+            .result = .{
+                .cancel_accept = .{ .actual = .{} },
+            },
+        });
+        return;
+    };
+
+    const index = try io_uring.jobs.borrow_hint(gpa, task);
+    errdefer io_uring.jobs.release(index);
+
+    const item = io_uring.jobs.get_ptr(index);
+    item.job = .{
+        .index = index,
+        .type = .{
+            .cancel_accept = .{ .target = target_index },
+        },
+        .task = task,
+    };
+
+    _ = try io_uring.uring.cancel(index, target_index, 0);
 }
 
 fn queue_connect(
@@ -698,6 +763,12 @@ fn reap(
     wait: bool,
 ) Errors.Reap![]results.Completion {
     const uring: *IoUring = @ptrCast(@alignCast(runner));
+    const pending = results.drainPending(
+        &uring.pending_completions,
+        completions,
+    );
+    if (pending.len != 0) return pending;
+
     // either wait for atleast 1 or just take whats there.
     const uring_nr: u32 = if (wait) 1 else 0;
 
@@ -734,13 +805,12 @@ fn reap(
                 },
                 .close => break :blk .close,
                 .accept => |accept| {
-                    if (cqe.res >= 0) log.debug(
-                        "new accept client_fd is {} with address ({f})",
-                        .{ cqe.res, accept.socket.addr },
-                    );
-
-                    switch (accept.socket.kind) {
-                        .tcp, .unix => break :blk .{
+                    if (cqe.res >= 0) {
+                        log.debug(
+                            "new accept client_fd is {} with address ({f})",
+                            .{ cqe.res, accept.socket.addr },
+                        );
+                        break :blk .{
                             .accept = .{
                                 .actual = .{
                                     .handle = cqe.res,
@@ -748,8 +818,7 @@ fn reap(
                                     .kind = accept.socket.kind,
                                 },
                             },
-                        },
-                        .udp => unreachable,
+                        };
                     }
 
                     const AcceptError = results.AcceptError;
@@ -761,6 +830,9 @@ fn reap(
                             },
                             .BADF => .{
                                 .err = AcceptError.InvalidFd,
+                            },
+                            .CANCELED => .{
+                                .err = AcceptError.Canceled,
                             },
                             .CONNABORTED => .{
                                 .err = AcceptError.ConnectionAborted,
@@ -787,6 +859,24 @@ fn reap(
                     };
 
                     break :blk .{ .accept = result };
+                },
+                .cancel_accept => {
+                    if (cqe.res >= 0) break :blk .{
+                        .cancel_accept = .{
+                            .actual = .{ .canceled = 1 },
+                        },
+                    };
+
+                    const e: linux.E = @fromBackingInt(@intCast(-cqe.res));
+                    break :blk .{ .cancel_accept = switch (e) {
+                        .NOENT, .ALREADY => .{
+                            .actual = .{ .retry = true },
+                        },
+                        .INVAL, .OPNOTSUPP => .{
+                            .err = error.OperationNotSupported,
+                        },
+                        else => .{ .err = error.Unexpected },
+                    } };
                 },
                 .connect => {
                     if (cqe.res >= 0) break :blk .{

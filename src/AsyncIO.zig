@@ -169,6 +169,7 @@ const Op = enum(u16) {
     connect = 1 << 9,
     recv = 1 << 10,
     send = 1 << 11,
+    cancel_accept = 1 << 12,
 };
 
 pub const Features = packed struct(u16) {
@@ -235,6 +236,7 @@ pub const Submission = union(Op) {
         socket: net.Socket.Handle,
         buffer: []const u8,
     },
+    cancel_accept: net.Socket.Handle,
 };
 
 pub const FileMode = enum {

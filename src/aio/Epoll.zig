@@ -5,6 +5,7 @@ wake_event_fd: posix.fd_t,
 events: []linux.epoll_event,
 
 jobs: pool.Pool(Job),
+pending_completions: std.ArrayList(results.Completion),
 
 pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Epoll {
     const size = options.size_tasks_initial + 1;
@@ -57,6 +58,7 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Epoll {
         .wake_event_fd = wake_event_fd,
         .events = events,
         .jobs = jobs,
+        .pending_completions = .empty,
     };
 }
 
@@ -64,6 +66,7 @@ pub fn inner_deinit(epoll: *Epoll, gpa: mem.Allocator) void {
     syscall.close(epoll.epoll_fd);
     gpa.free(epoll.events);
     epoll.jobs.deinit(gpa);
+    epoll.pending_completions.deinit(gpa);
     syscall.close(epoll.wake_event_fd);
 }
 
@@ -90,6 +93,11 @@ pub fn queue_job(
             gpa,
             task,
             accept.socket,
+        ),
+        .cancel_accept => |socket| epoll.queue_cancel_accept(
+            gpa,
+            task,
+            socket,
         ),
         .connect => |connect| epoll.queue_connect(
             gpa,
@@ -164,6 +172,16 @@ fn queue_accept(
     task: usize,
     socket: *const net.Socket,
 ) Errors.Accept!void {
+    var already_registered = false;
+    var iter = epoll.jobs.iterator();
+    while (iter.next()) |job| switch (job.type) {
+        .accept => |accept| if (accept.listener == socket.handle) {
+            already_registered = true;
+            break;
+        },
+        else => {},
+    };
+
     const index = try epoll.jobs.borrow_hint(gpa, task);
     errdefer epoll.jobs.release(index);
 
@@ -175,17 +193,87 @@ fn queue_accept(
                 .handle = socket.handle,
                 .kind = socket.kind,
                 .addr = .init(socket.addr.family()),
-            } },
+            }, .listener = socket.handle },
         },
         .task = task,
     };
 
-    var event: linux.epoll_event = .{
-        .events = linux.EPOLL.IN,
-        .data = .{ .u64 = index },
+    if (!already_registered) {
+        var event: linux.epoll_event = .{
+            .events = linux.EPOLL.IN,
+            .data = .{ .u64 = index },
+        };
+        try epoll.add_fd(socket.handle, &event);
+    }
+}
+
+fn queue_cancel_accept(
+    epoll: *Epoll,
+    gpa: mem.Allocator,
+    task: usize,
+    socket: net.Socket.Handle,
+) Errors.Accept!void {
+    var count: usize = 0;
+    var count_iter = epoll.jobs.iterator();
+    while (count_iter.next()) |job| switch (job.type) {
+        .accept => |accept| if (accept.listener == socket) {
+            count += 1;
+        },
+        else => {},
     };
 
-    try epoll.add_or_mod_fd(socket.handle, &event);
+    try epoll.pending_completions.ensureUnusedCapacity(gpa, count + 1);
+    if (count != 0) try epoll.remove_fd(socket);
+
+    var iter = epoll.jobs.iterator();
+    while (iter.next_index()) |index| {
+        const job = epoll.jobs.get(index);
+        switch (job.type) {
+            .accept => |accept| {
+                if (accept.listener != socket) continue;
+                epoll.jobs.release(index);
+                epoll.pending_completions.appendAssumeCapacity(.{
+                    .task = job.task,
+                    .result = .{ .accept = .{ .err = error.Canceled } },
+                });
+            },
+            else => {},
+        }
+    }
+
+    epoll.pending_completions.appendAssumeCapacity(.{
+        .task = task,
+        .result = .{
+            .cancel_accept = .{
+                .actual = .{ .canceled = count },
+            },
+        },
+    });
+}
+
+fn advance_accept(
+    epoll: *Epoll,
+    current: usize,
+    socket: net.Socket.Handle,
+) !void {
+    var iter = epoll.jobs.iterator();
+    while (iter.next_index()) |index| {
+        if (index == current) continue;
+        const job = epoll.jobs.get(index);
+        switch (job.type) {
+            .accept => |accept| {
+                if (accept.listener != socket) continue;
+                var event: linux.epoll_event = .{
+                    .events = linux.EPOLL.IN,
+                    .data = .{ .u64 = index },
+                };
+                return try epoll.mod_fd(socket, &event);
+            },
+            else => {},
+        }
+    }
+
+    try epoll.remove_fd(socket);
 }
 
 fn queue_connect(
@@ -349,6 +437,12 @@ pub fn reap(
     wait: bool,
 ) ![]results.Completion {
     const epoll: *Epoll = @ptrCast(@alignCast(runner));
+    const pending = results.drainPending(
+        &epoll.pending_completions,
+        completions,
+    );
+    if (pending.len != 0) return pending;
+
     var reaped: usize = 0;
 
     while (reaped == 0 and wait) {
@@ -436,8 +530,13 @@ pub fn reap(
                             } };
                         };
 
+                        try epoll.advance_accept(
+                            job_index,
+                            accept.listener,
+                        );
                         break :blk .{ .accept = result };
                     },
+                    .cancel_accept => unreachable,
                     .connect => {
                         debug.assert(event.events & linux.EPOLL.OUT != 0);
 
@@ -532,6 +631,7 @@ pub fn to_async(epoll: *Epoll) AsyncIO {
         .features = .init(&.{
             .timer,
             .accept,
+            .cancel_accept,
             .connect,
             .recv,
             .send,

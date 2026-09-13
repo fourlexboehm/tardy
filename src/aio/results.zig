@@ -20,6 +20,7 @@ pub fn Resulted(comptime T: type, comptime E: type) type {
 }
 
 pub const AcceptError = error{
+    Canceled,
     WouldBlock,
     InvalidFd,
     ConnectionAborted,
@@ -33,6 +34,11 @@ pub const AcceptError = error{
     SocketNotListening,
     BlockedByFirewall,
     ProtocolFailure,
+    Unexpected,
+};
+
+pub const CancelAcceptError = error{
+    OperationNotSupported,
     Unexpected,
 };
 
@@ -184,6 +190,14 @@ pub const DeleteError = error{
 };
 
 pub const AcceptResult = Resulted(Socket, AcceptError);
+pub const CancelAcceptOutcome = struct {
+    canceled: usize = 0,
+    retry: bool = false,
+};
+pub const CancelAcceptResult = Resulted(
+    CancelAcceptOutcome,
+    CancelAcceptError,
+);
 
 pub const ConnectResult = Resulted(void, ConnectError);
 pub const RecvResult = Resulted(usize, RecvError);
@@ -217,6 +231,7 @@ pub const Result = union(enum) {
     /// If we have returned a stat object.
     stat: StatResult,
     accept: AcceptResult,
+    cancel_accept: CancelAcceptResult,
     connect: ConnectResult,
     recv: RecvResult,
     send: SendResult,
@@ -234,3 +249,20 @@ pub const Completion = struct {
     task: usize,
     result: Result,
 };
+
+pub fn drainPending(
+    pending: *std.ArrayList(Completion),
+    completions: []Completion,
+) []Completion {
+    const count = @min(pending.items.len, completions.len);
+    if (count == 0) return completions[0..0];
+
+    @memcpy(completions[0..count], pending.items[0..count]);
+    std.mem.copyForwards(
+        Completion,
+        pending.items[0 .. pending.items.len - count],
+        pending.items[count..],
+    );
+    pending.shrinkRetainingCapacity(pending.items.len - count);
+    return completions[0..count];
+}

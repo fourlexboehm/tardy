@@ -2,9 +2,10 @@ pub const Poll = @This();
 
 wake_pipe: [2]fs.File.Handle,
 fd_list: std.ArrayList(syscall.pollfd),
-fd_job_map: array_hash_map.Auto(fs.File.Handle, Job),
+jobs: std.ArrayList(Job),
 
 timers: TimerQueue,
+pending_completions: std.ArrayList(results.Completion),
 
 pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Poll {
     const size = options.size_tasks_initial + 1;
@@ -59,10 +60,8 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Poll {
     var fd_list: std.ArrayList(syscall.pollfd) = try .initCapacity(gpa, size);
     errdefer fd_list.deinit(gpa);
 
-    var fd_job_map: array_hash_map.Auto(fs.File.Handle, Job) = .empty;
-    errdefer fd_job_map.deinit(gpa);
-
-    try fd_job_map.ensureTotalCapacity(gpa, size);
+    var jobs: std.ArrayList(Job) = try .initCapacity(gpa, size);
+    errdefer jobs.deinit(gpa);
 
     if (comptime native_os == .windows) {
         try fd_list.append(gpa, .{
@@ -70,7 +69,7 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Poll {
             .events = syscall.POLL.IN,
             .revents = 0,
         });
-        try fd_job_map.put(gpa, @ptrCast(pipe[0]), .{
+        jobs.appendAssumeCapacity(.{
             .index = 0,
             .type = .wake,
             .task = 0,
@@ -81,7 +80,7 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Poll {
             .events = syscall.POLL.IN,
             .revents = 0,
         });
-        try fd_job_map.put(gpa, pipe[0], .{
+        jobs.appendAssumeCapacity(.{
             .index = 0,
             .type = .wake,
             .task = 0,
@@ -94,15 +93,17 @@ pub fn init(gpa: mem.Allocator, options: AsyncIO.Options) !Poll {
     return .{
         .wake_pipe = pipe,
         .fd_list = fd_list,
-        .fd_job_map = fd_job_map,
+        .jobs = jobs,
         .timers = timers,
+        .pending_completions = .empty,
     };
 }
 
 pub fn inner_deinit(poll: *Poll, gpa: mem.Allocator) void {
     poll.fd_list.deinit(gpa);
-    poll.fd_job_map.deinit(gpa);
+    poll.jobs.deinit(gpa);
     poll.timers.deinit(gpa);
+    poll.pending_completions.deinit(gpa);
 
     for (poll.wake_pipe) |fd| if (comptime native_os == .windows)
         syscall.ws2.closesock(fd) catch unreachable
@@ -133,6 +134,11 @@ pub fn queue_job(
             gpa,
             task,
             accept.socket,
+        ),
+        .cancel_accept => |socket| poll.queue_cancel_accept(
+            gpa,
+            task,
+            socket,
         ),
         .connect => |connect| poll.queue_connect(
             gpa,
@@ -179,10 +185,12 @@ fn queue_accept(
         .events = syscall.POLL.IN,
         .revents = 0,
     });
-    try poll.fd_job_map.put(gpa, socket.handle, .{
+    errdefer _ = poll.fd_list.pop();
+    try poll.jobs.append(gpa, .{
         .index = 0,
         .type = .{
             .accept = .{
+                .listener = socket.handle,
                 .socket = .{
                     .handle = socket.handle,
                     .kind = socket.kind,
@@ -191,6 +199,49 @@ fn queue_accept(
             },
         },
         .task = task,
+    });
+}
+
+fn queue_cancel_accept(
+    poll: *Poll,
+    gpa: mem.Allocator,
+    task: usize,
+    socket: net.Socket.Handle,
+) Errors.Accept!void {
+    var count: usize = 0;
+    for (poll.jobs.items) |job| switch (job.type) {
+        .accept => |accept| if (accept.listener == socket) {
+            count += 1;
+        },
+        else => {},
+    };
+
+    try poll.pending_completions.ensureUnusedCapacity(gpa, count + 1);
+    var i = poll.jobs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const job = poll.jobs.items[i];
+        switch (job.type) {
+            .accept => |accept| {
+                if (accept.listener != socket) continue;
+                _ = poll.fd_list.swapRemove(i);
+                _ = poll.jobs.swapRemove(i);
+                poll.pending_completions.appendAssumeCapacity(.{
+                    .task = job.task,
+                    .result = .{ .accept = .{ .err = error.Canceled } },
+                });
+            },
+            else => {},
+        }
+    }
+
+    poll.pending_completions.appendAssumeCapacity(.{
+        .task = task,
+        .result = .{
+            .cancel_accept = .{
+                .actual = .{ .canceled = count },
+            },
+        },
     });
 }
 
@@ -213,7 +264,8 @@ fn queue_connect(
         .events = syscall.POLL.OUT,
         .revents = 0,
     });
-    try poll.fd_job_map.put(gpa, socket.handle, .{
+    errdefer _ = poll.fd_list.pop();
+    try poll.jobs.append(gpa, .{
         .index = 0,
         .type = .{
             .connect = .{
@@ -236,7 +288,8 @@ fn queue_recv(
         .events = syscall.POLL.IN,
         .revents = 0,
     });
-    try poll.fd_job_map.put(gpa, socket, .{
+    errdefer _ = poll.fd_list.pop();
+    try poll.jobs.append(gpa, .{
         .index = 0,
         .type = .{
             .recv = .{
@@ -260,7 +313,8 @@ fn queue_send(
         .events = syscall.POLL.OUT,
         .revents = 0,
     });
-    try poll.fd_job_map.put(gpa, socket, .{
+    errdefer _ = poll.fd_list.pop();
+    try poll.jobs.append(gpa, .{
         .index = 0,
         .type = .{
             .send = .{
@@ -292,6 +346,12 @@ pub fn reap(
     wait: bool,
 ) ![]results.Completion {
     const poll: *Poll = @ptrCast(@alignCast(runner));
+    const pending = results.drainPending(
+        &poll.pending_completions,
+        completions,
+    );
+    if (pending.len != 0) return pending;
+
     var reaped: usize = 0;
 
     poll_loop: while (reaped == 0 and wait) {
@@ -335,12 +395,12 @@ pub fn reap(
             const pfd = poll.fd_list.items[index];
             log.debug("revents={x}", .{pfd.revents});
             if (pfd.revents == 0) continue;
-            const job = poll.fd_job_map.getPtr(pfd.fd).?;
+            const job = &poll.jobs.items[index];
 
             var remove: bool = true;
             defer if (remove) {
                 _ = poll.fd_list.swapRemove(index);
-                _ = poll.fd_job_map.swapRemove(pfd.fd);
+                _ = poll.jobs.swapRemove(index);
                 ready -= 1;
             };
 
@@ -403,6 +463,7 @@ pub fn reap(
                             },
                         };
                     },
+                    .cancel_accept => unreachable,
                     .connect => {
                         debug.assert(pfd.revents & syscall.POLL.OUT != 0);
 
@@ -527,6 +588,7 @@ pub fn to_async(poll: *Poll) AsyncIO {
         .features = .init(&.{
             .timer,
             .accept,
+            .cancel_accept,
             .connect,
             .recv,
             .send,
@@ -572,7 +634,6 @@ const Io = std.Io;
 const debug = std.debug;
 const posix = std.posix;
 const math = std.math;
-const array_hash_map = std.array_hash_map;
 const mem = std.mem;
 const OoM = mem.Allocator.Error;
 const builtin = @import("builtin");

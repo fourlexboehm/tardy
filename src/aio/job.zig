@@ -10,6 +10,7 @@ pub const Job = struct {
         write: WriteJob,
         close: fs.File.Handle,
         accept: AcceptJob,
+        cancel_accept: CancelAcceptJob,
         connect: ConnectJob,
         send: SendJob,
         recv: RecvJob,
@@ -54,7 +55,12 @@ const WriteJob = struct {
 };
 
 const AcceptJob = struct {
+    listener: net.Socket.Handle,
     socket: net.Socket,
+};
+
+const CancelAcceptJob = struct {
+    target: usize,
 };
 
 const ConnectJob = struct {
